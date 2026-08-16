@@ -1,0 +1,217 @@
+# Single gateway for the whole AppFlowy stack. Every upstream is a process in
+# this container, so all of them are on loopback and no DNS resolver is needed.
+# Derived from AppFlowy-Cloud's nginx/nginx.conf plus the static-asset handling
+# from the appflowy_web image.
+
+user root;
+worker_processes auto;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    sendfile on;
+    keepalive_timeout 65;
+    server_tokens off;
+
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" "$http_user_agent"';
+    access_log /dev/stdout main;
+    error_log  /dev/stderr warn;
+
+    gzip on;
+    gzip_static on;
+    gzip_comp_level 5;
+    gzip_vary on;
+    gzip_types text/plain text/css application/json application/x-javascript text/xml application/xml application/xml+rss text/javascript application/javascript application/wasm;
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        '' close;
+    }
+
+    # Railway's edge sets X-Forwarded-For to "<client>, <edge>" and the edge hop
+    # rotates per request, so any per-client key must use the first address only.
+    map $http_x_forwarded_for $client_ip {
+        '~^([^,\s]+)' $1;
+        default       $remote_addr;
+    }
+
+    limit_req_zone $client_ip zone=auth_zone:10m rate=__AUTH_RATE__r/m;
+
+    server {
+        listen __PORT__;
+        client_max_body_size 10M;
+        underscores_in_headers on;
+
+        set $cloud_backend    "http://127.0.0.1:8000";
+        set $gotrue_backend   "http://127.0.0.1:9999";
+        set $web_backend      "http://127.0.0.1:3000";
+        set $minio_console    "http://127.0.0.1:9001";
+        set $minio_api        "http://127.0.0.1:9000";
+
+        # Railway's healthcheck. Upstream exposes /api/health on appflowy_cloud;
+        # proxying it means a green deploy implies a working API, not just a
+        # running nginx.
+        location = /healthz {
+            access_log off;
+            proxy_pass $cloud_backend/api/health;
+            proxy_set_header Host $http_host;
+        }
+
+        # GoTrue. Sign-in and token refresh are throttled per client address;
+        # upstream has no lockout of any kind.
+        location /gotrue/ {
+            proxy_pass $gotrue_backend;
+            rewrite ^/gotrue(/.*)$ $1 break;
+            proxy_set_header Host $http_host;
+            proxy_pass_request_headers on;
+        }
+
+        location /gotrue/token {
+            limit_req zone=auth_zone burst=__AUTH_BURST__ nodelay;
+            proxy_pass $gotrue_backend/token$is_args$args;
+            proxy_set_header Host $http_host;
+            proxy_pass_request_headers on;
+        }
+
+        location /gotrue/signup {
+            limit_req zone=auth_zone burst=__AUTH_BURST__ nodelay;
+            proxy_pass $gotrue_backend/signup$is_args$args;
+            proxy_set_header Host $http_host;
+            proxy_pass_request_headers on;
+        }
+
+        location /ws {
+            proxy_pass $cloud_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "Upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_ip;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 86400s;
+        }
+
+        location /api {
+            proxy_pass $cloud_backend;
+            proxy_set_header X-Request-Id $request_id;
+            proxy_set_header Host $http_host;
+
+            location ~* ^/api/workspace/([a-zA-Z0-9_-]+)/publish$ {
+                proxy_pass $cloud_backend;
+                proxy_request_buffering off;
+                client_max_body_size 256M;
+            }
+
+            location /api/chat {
+                proxy_pass $cloud_backend;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                chunked_transfer_encoding on;
+                proxy_buffering off;
+                proxy_cache off;
+                proxy_read_timeout 600s;
+                proxy_connect_timeout 600s;
+                proxy_send_timeout 600s;
+            }
+
+            location /api/import {
+                proxy_pass $cloud_backend;
+                proxy_set_header X-Request-Id $request_id;
+                proxy_set_header Host $http_host;
+                proxy_read_timeout 600s;
+                proxy_connect_timeout 600s;
+                proxy_send_timeout 600s;
+                proxy_request_buffering off;
+                proxy_buffering off;
+                proxy_cache off;
+                client_max_body_size 2G;
+            }
+        }
+
+        location /ai/ {
+            proxy_pass $cloud_backend;
+            proxy_set_header X-Request-Id $request_id;
+            proxy_set_header Host $http_host;
+        }
+
+        # Presigned upload/download URLs are signed against the internal MinIO
+        # host, so the Host header has to be replayed verbatim or the signature
+        # will not verify.
+        location /minio-api/ {
+            proxy_pass $minio_api;
+            proxy_set_header Host 127.0.0.1:9000;
+            proxy_set_header X-Real-IP $client_ip;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            rewrite ^/minio-api/(.*) /$1 break;
+            proxy_connect_timeout 300s;
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
+            proxy_request_buffering off;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            chunked_transfer_encoding off;
+            client_max_body_size 0;
+        }
+
+        # MinIO console, behind the same credentials the deployer already has.
+        location /minio/ {
+            proxy_pass $minio_console;
+            rewrite ^/minio/(.*) /$1 break;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $client_ip;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-NginX-Proxy true;
+            real_ip_header X-Real-IP;
+            proxy_connect_timeout 300s;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            chunked_transfer_encoding off;
+        }
+
+        # Static assets straight off disk, everything else to the bun SSR server.
+        location /static/ { root /usr/share/nginx/html; expires 30d; access_log off; }
+        location /covers/ { root /usr/share/nginx/html; expires 30d; access_log off; }
+        location /af_icons/ {
+            root /usr/share/nginx/html;
+            expires 30d;
+            access_log off;
+            add_header 'Access-Control-Allow-Origin' '*' always;
+            add_header 'Access-Control-Allow-Methods' 'GET' always;
+        }
+        location = /appflowy.svg  { root /usr/share/nginx/html; expires 30d; access_log off; }
+        location = /appflowy.ico  { root /usr/share/nginx/html; expires 30d; access_log off; }
+        location = /og-image.png  { root /usr/share/nginx/html; expires 30d; access_log off; }
+        location = /.well-known/apple-app-site-association {
+            root /usr/share/nginx/html;
+            default_type application/json;
+        }
+        location = /.well-known/assetlinks.json {
+            root /usr/share/nginx/html;
+            default_type application/json;
+        }
+
+        location / {
+            proxy_pass $web_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host $host;
+            proxy_set_header X-Scheme $scheme;
+            proxy_cache_bypass $http_upgrade;
+            proxy_connect_timeout 30s;
+            proxy_send_timeout 30s;
+            proxy_read_timeout 30s;
+        }
+    }
+}
