@@ -1,5 +1,9 @@
 # appflowy-railway
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/appflowy-cloud-or-just-updated-notion-al?referralCode=Z1xivh&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
+**Deploy on Railway:** [AppFlowy Cloud template](https://railway.com/deploy/appflowy-cloud-or-just-updated-notion-al?referralCode=Z1xivh&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
 Wrapper image that runs the whole [AppFlowy Cloud](https://github.com/AppFlowy-IO/AppFlowy-Cloud)
 self-hosted stack in a single container, for the Railway template
 `AppFlowy | (Just Updated) Notion Alternative`.
